@@ -2,6 +2,12 @@
 import argparse
 import logging
 import os
+
+# Reduce CUDA fragmentation so VAE decode of long/high-res clips fits on 24 GiB
+# GPUs. Must be set before torch initializes its CUDA allocator. Respects an
+# existing value if the user already exported one.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import sys
 import warnings
 from datetime import datetime
@@ -65,7 +71,9 @@ def _validate_args(args):
     assert args.task in WAN_CONFIGS, f"Unsupport task: {args.task}"
     assert args.task in EXAMPLE_PROMPT, f"Unsupport task: {args.task}"
 
-    if args.prompt is None:
+    # Omitting --prompt for ti2v-5B enables frame-only conditioning: T5 is not
+    # loaded and a precomputed unconditional embedding is used instead.
+    if args.prompt is None and "ti2v" not in args.task:
         args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
     if args.image is None and "image" in EXAMPLE_PROMPT[args.task]:
         args.image = EXAMPLE_PROMPT[args.task]["image"]
@@ -377,7 +385,7 @@ def generate(args):
         logging.info(f"Input image: {args.image}")
 
     # prompt extend
-    if args.use_prompt_extend:
+    if args.use_prompt_extend and args.prompt is not None:
         logging.info("Extending prompt ...")
         if rank == 0:
             prompt_output = prompt_expander(
@@ -437,6 +445,7 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            skip_text_encoder=(args.prompt is None),
         )
 
         logging.info(f"Generating video ...")
@@ -542,8 +551,8 @@ def generate(args):
     if rank == 0:
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            formatted_prompt = args.prompt.replace(" ", "_").replace("/",
-                                                                     "_")[:50]
+            formatted_prompt = (args.prompt or "frameonly").replace(
+                " ", "_").replace("/", "_")[:50]
             suffix = '.mp4'
             args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}" + suffix
 

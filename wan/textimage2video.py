@@ -45,6 +45,7 @@ class WanTI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        skip_text_encoder=False,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -85,13 +86,28 @@ class WanTI2V:
             self.init_on_cpu = False
 
         shard_fn = partial(shard_model, device_id=device_id)
-        self.text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=config.t5_dtype,
-            device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None)
+        # Frame-only conditioning: when no prompt is given, skip loading T5
+        # entirely and reuse a precomputed unconditional text embedding.
+        if skip_text_encoder:
+            uncond_path = os.path.join(checkpoint_dir, "uncond_context.pt")
+            if not os.path.exists(uncond_path):
+                raise FileNotFoundError(
+                    f"skip_text_encoder=True but {uncond_path} was not found. "
+                    "Run precompute_uncond_context.py once (with T5 available) "
+                    "to create it.")
+            logging.info(f"No prompt given; skipping T5, using cached "
+                         f"unconditional context from {uncond_path}.")
+            self.text_encoder = None
+            self._uncond_ctx = torch.load(uncond_path, map_location="cpu")
+        else:
+            self.text_encoder = T5EncoderModel(
+                text_len=config.text_len,
+                dtype=config.t5_dtype,
+                device=torch.device('cpu'),
+                checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
+                tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+                shard_fn=shard_fn if t5_fsdp else None)
+            self._uncond_ctx = None
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
@@ -296,7 +312,11 @@ class WanTI2V:
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
 
-        if not self.t5_cpu:
+        if self.text_encoder is None:
+            # Frame-only conditioning: reuse cached unconditional embedding for
+            # both CFG branches (T5 was never loaded).
+            context = context_null = [self._uncond_ctx.to(self.device)]
+        elif not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
             context_null = self.text_encoder([n_prompt], self.device)
@@ -497,7 +517,11 @@ class WanTI2V:
             n_prompt = self.sample_neg_prompt
 
         # preprocess
-        if not self.t5_cpu:
+        if self.text_encoder is None:
+            # Frame-only conditioning: reuse cached unconditional embedding for
+            # both CFG branches (T5 was never loaded).
+            context = context_null = [self._uncond_ctx.to(self.device)]
+        elif not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
             context_null = self.text_encoder([n_prompt], self.device)
