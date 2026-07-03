@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+build-backend = "build_backend"
 
 [project]
 name = "wan"
@@ -26,7 +26,10 @@ dependencies = [
     "ftfy",
     "dashscope",
     "imageio-ffmpeg",
-    "flash_attn",
+    "dashscope",
+    "peft",
+    "decord",
+    "librosa",
     "numpy>=1.23.5,<2"
 ]
 
