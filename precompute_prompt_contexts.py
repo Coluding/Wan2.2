@@ -61,8 +61,12 @@ def main():
     with open(args.prompts_file) as f:
         spec = yaml.safe_load(f) or {}
     tasks = spec.get("tasks") or {}
-    if not tasks:
-        raise ValueError(f"{args.prompts_file}: no 'tasks' mapping found.")
+    pool_prompts = spec.get("prompts")  # flat, task-independent set (sampled per clip)
+    if not tasks and not pool_prompts:
+        raise ValueError(
+            f"{args.prompts_file}: need a 'prompts' list (task-independent pool) or a "
+            "'tasks' mapping (per-task prompts)."
+        )
     default_prompt = spec.get("default") or "A robot arm performs a manipulation task."
     negative_prompt = spec.get("negative") or cfg.sample_neg_prompt  # None/empty -> model default
 
@@ -77,22 +81,57 @@ def main():
     def encode(text):
         return te([text], torch.device("cpu"))[0]  # [L, C]
 
-    positive = {name: encode(prompt) for name, prompt in tasks.items()}
-    positive["__default__"] = encode(default_prompt)
+    def _as_prompt_list(value):
+        """A task/default value may be one prompt (str) or a set of paraphrases
+        (list of str). Normalise to a non-empty list of strings."""
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple)) and value:
+            return [str(v) for v in value]
+        raise ValueError(f"prompt value must be a string or a non-empty list, got {value!r}")
+
+    def encode_prompts(value):
+        """Single str -> one [L,C] tensor; list of str -> list of [Lᵢ,C] tensors
+        (the provider samples one per clip during training)."""
+        prompts = _as_prompt_list(value)
+        embs = [encode(p) for p in prompts]
+        return embs[0] if len(embs) == 1 else embs
+
+    positive = {name: encode_prompts(prompt) for name, prompt in tasks.items()}
+    positive["__default__"] = encode_prompts(default_prompt)
 
     table = {
         "positive": positive,
         "negative": encode(negative_prompt),
         "uncond": encode(""),
-        "prompts": {**{name: prompt for name, prompt in tasks.items()},
-                    "__default__": default_prompt, "__negative__": negative_prompt},
+        "prompts": {**{name: _as_prompt_list(prompt) for name, prompt in tasks.items()},
+                    "__default__": _as_prompt_list(default_prompt), "__negative__": negative_prompt},
         "text_len": cfg.text_len,
     }
+
+    # Task-independent pool: `default` first (deterministic eval), then the `prompts`
+    # set. Training samples one per clip; pool takes precedence over `positive`.
+    if pool_prompts:
+        pool_texts = [default_prompt] + _as_prompt_list(pool_prompts) if spec.get("default") \
+            else _as_prompt_list(pool_prompts)
+        table["pool"] = [encode(p) for p in pool_texts]
+        table["prompts"]["__pool__"] = pool_texts
+
     torch.save(table, out)
 
-    a_key = next(iter(tasks))
-    print(f"Encoded {len(tasks)} task prompts + default + negative + uncond.")
-    print(f"  embedding shape (e.g. {a_key!r}): {tuple(positive[a_key].shape)} dtype={positive[a_key].dtype}")
+    if pool_prompts:
+        pool_texts = table["prompts"]["__pool__"]
+        print(f"Encoded a task-independent pool of {len(pool_texts)} prompts (eval uses #0) "
+              f"+ negative + uncond. Shape {tuple(table['pool'][0].shape)}.")
+        print(f"  #0 (eval): {pool_texts[0][:70]!r}{'...' if len(pool_texts[0]) > 70 else ''}")
+    else:
+        a_key = next(iter(tasks))
+        n_prompts = sum(len(_as_prompt_list(p)) for p in tasks.values())
+        a_emb = positive[a_key]
+        a_shape = tuple(a_emb[0].shape) if isinstance(a_emb, list) else tuple(a_emb.shape)
+        a_count = len(a_emb) if isinstance(a_emb, list) else 1
+        print(f"Encoded {n_prompts} task prompts across {len(tasks)} tasks + default + negative + uncond.")
+        print(f"  {a_key!r}: {a_count} prompt(s), embedding shape {a_shape} dtype={(a_emb[0] if isinstance(a_emb, list) else a_emb).dtype}")
     print(f"  negative: {negative_prompt[:60]!r}{'...' if len(negative_prompt) > 60 else ''}")
     print(f"Saved prompt-context table -> {out}")
 
